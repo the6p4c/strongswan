@@ -374,6 +374,7 @@ METHOD(simaka_card_t, get_quintuplet, status_t,
 
 	snprintf(full_nai, sizeof(full_nai), "%Y", id);
 
+	// TODO: change to quintuplet
 	DBG2(DBG_IKE, "looking for triplet: %Y rand %b", id, rand, SIM_RAND_LEN);
 
 	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &hContext);
@@ -399,8 +400,6 @@ METHOD(simaka_card_t, get_quintuplet, status_t,
 		return FALSE;
 	}
 
-	DBG0(DBG_IKE, "dwReaders = %d", dwReaders);
-
 	/* mszReaders is a multi-string of readers, separated by '\0' and
 	 * terminated by an additional '\0' */
 	for (cur_reader = mszReaders; *cur_reader != '\0' && found == FALSE;
@@ -412,6 +411,8 @@ METHOD(simaka_card_t, get_quintuplet, status_t,
 		BYTE pbRecvBuffer[64];
 		DWORD dwRecvLength;
 		char imsi[SIM_IMSI_MAX_LEN + 1];
+		int ck_len;
+		int ik_len;
 
 		/* See GSM 11.11 for SIM APDUs */
 		static const BYTE pbSelectMF[] = { 0xa0, 0xa4, 0x00, 0x00, 0x02, 0x3f, 0x00 };
@@ -423,10 +424,9 @@ METHOD(simaka_card_t, get_quintuplet, status_t,
 			0x10,
 			0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0x49, 0xFF, 0xFF, 0x89, 0x04, 0x0B, 0x00, 0xFF
 		};
-		BYTE pbRunUMTSAlgorithm[5 + 1 + AKA_RAND_LEN + 1 + AKA_AUTN_LEN] = { 0x00, 0x88, 0x00, 0x81, 0x22 };
+		/* See TS 31.102, ETSI TS 102-221 for USIM APDUs */
+		BYTE pbAuthenticate[5 + 1 + AKA_RAND_LEN + 1 + AKA_AUTN_LEN] = { 0x00, 0x88, 0x00, 0x81, 0x22 };
 		BYTE pbGetResponse[] = { 0x00, 0xc0, 0x00, 0x00, 0x00 };
-
-		DBG0(DBG_IKE, "cur_reader = %d \"%s\"", cur_reader, cur_reader);
 
 		/* If on 2nd or later reader, make sure we end the transaction
 		 * and disconnect card in the previous reader */
@@ -443,10 +443,10 @@ METHOD(simaka_card_t, get_quintuplet, status_t,
 		}
 
 		/* Copy RAND and AUTN into APDU */
-		pbRunUMTSAlgorithm[5] = AKA_RAND_LEN;
-		memcpy(pbRunUMTSAlgorithm + 6, rand, AKA_RAND_LEN);
-		pbRunUMTSAlgorithm[6 + AKA_RAND_LEN] = AKA_AUTN_LEN;
-		memcpy(pbRunUMTSAlgorithm + 6 + AKA_RAND_LEN + 1, autn, AKA_AUTN_LEN);
+		pbAuthenticate[5] = AKA_RAND_LEN;
+		memcpy(pbAuthenticate + 6, rand, AKA_RAND_LEN);
+		pbAuthenticate[6 + AKA_RAND_LEN] = AKA_AUTN_LEN;
+		memcpy(pbAuthenticate + 6 + AKA_RAND_LEN + 1, autn, AKA_AUTN_LEN);
 
 		rv = SCardConnect(hContext, cur_reader, SCARD_SHARE_SHARED,
 			SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, &hCard, &dwActiveProtocol);
@@ -562,19 +562,15 @@ METHOD(simaka_card_t, get_quintuplet, status_t,
 			continue;
 		}
 
-		DBG0(DBG_IKE, "oh hello there");
-
-		/* APDU: Select USIM */
+		/* APDU: Select USIM application */
 		dwRecvLength = sizeof(pbRecvBuffer);
 		rv = SCardTransmit(hCard, pioSendPci, pbSelectUSIM, sizeof(pbSelectUSIM),
 						   &pioRecvPci, pbRecvBuffer, &dwRecvLength);
-		DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
 		if (rv != SCARD_S_SUCCESS)
 		{
 			DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
 			continue;
 		}
-		DBG1(DBG_IKE, "Select USIM: %d %02x%02x", pbRecvBuffer, pbRecvBuffer[0], pbRecvBuffer[1]);
 		if (dwRecvLength < APDU_STATUS_LEN ||
 			pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN] != 0x61)
 		{
@@ -583,27 +579,25 @@ METHOD(simaka_card_t, get_quintuplet, status_t,
 			continue;
 		}
 
-		/* APDU: Run UMTS Algorithm */
+		/* APDU: Authenticate */
 		dwRecvLength = sizeof(pbRecvBuffer);
 		rv = SCardTransmit(hCard, pioSendPci,
-						   pbRunUMTSAlgorithm, sizeof(pbRunUMTSAlgorithm),
+						   pbAuthenticate, sizeof(pbAuthenticate),
 						   &pioRecvPci, pbRecvBuffer, &dwRecvLength);
-		DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
 		if (rv != SCARD_S_SUCCESS)
 		{
 			DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
 			continue;
 		}
-		DBG1(DBG_IKE, "Run UMTS Algorithm: %d %02x%02x", (u_int)dwRecvLength, pbRecvBuffer[0], pbRecvBuffer[1]);
 		if (dwRecvLength < APDU_STATUS_LEN ||
 			pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN] != 0x61)
 		{
-			DBG1(DBG_IKE, "Run UMTS Algorithm failed: %b",
+			DBG1(DBG_IKE, "Authenticate failed: %b",
 				 pbRecvBuffer, (u_int)dwRecvLength);
 			continue;
 		}
 
-		/* APDU: Get Response (of Run UMTS Algorithm) */
+		/* APDU: Get Response (of Authenticate) */
 		pbGetResponse[4] = pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN+1]; // Le
 		dwRecvLength = sizeof(pbRecvBuffer);
 		rv = SCardTransmit(hCard, pioSendPci, pbGetResponse, sizeof(pbGetResponse),
@@ -624,25 +618,50 @@ METHOD(simaka_card_t, get_quintuplet, status_t,
 			continue;
 		}
 
-		BYTE *buf = pbRecvBuffer;
-		if (*buf != 0xdb) {
-			DBG1(DBG_IKE, "Get Response incorrect tag: %02x", *buf);
+		/* Extract out RES, CK and IK from response */
+		BYTE *cursor = pbRecvBuffer;
+		if (dwRecvLength < 2 + APDU_STATUS_LEN)
+		{
+			DBG1(DBG_IKE, "Get Response incorrect length: %b",
+				 pbRecvBuffer, (u_int)dwRecvLength);
 			continue;
 		}
-		buf++;
 
-		*res_len = *buf;
-		buf++;
-		memcpy(res, buf, *res_len);
-		buf += *res_len;
+		if (*cursor++ != 0xdb) {
+			DBG1(DBG_IKE, "Get Response incorrect tag: %b",
+				 pbRecvBuffer, (u_int)dwRecvLength);
+			continue;
+		}
 
-		buf++;
-		memcpy(ck, buf, AKA_CK_LEN);
-		buf += AKA_CK_LEN;
+		*res_len = *cursor++;
+		if (dwRecvLength < 2 + *res_len + APDU_STATUS_LEN || *res_len > AKA_RES_MAX)
+		{
+			DBG1(DBG_IKE, "Get Response incorrect length: %b",
+				 pbRecvBuffer, (u_int)dwRecvLength);
+			continue;
+		}
+		memcpy(res, cursor, *res_len);
+		cursor += *res_len;
 
-		buf++;
-		memcpy(ik, buf, AKA_IK_LEN);
-		buf += AKA_IK_LEN;
+		ck_len = *cursor++;
+		if (dwRecvLength < 2 + *res_len + 1 + ck_len + APDU_STATUS_LEN || ck_len != AKA_CK_LEN)
+		{
+			DBG1(DBG_IKE, "Get Response incorrect length: %b",
+				 pbRecvBuffer, (u_int)dwRecvLength);
+			continue;
+		}
+		memcpy(ck, cursor, AKA_CK_LEN);
+		cursor += AKA_CK_LEN;
+
+		ik_len = *cursor++;
+		if (dwRecvLength < 2 + *res_len + 1 + ck_len + 1 + ik_len + APDU_STATUS_LEN || ck_len != AKA_IK_LEN)
+		{
+			DBG1(DBG_IKE, "Get Response incorrect length: %b",
+				 pbRecvBuffer, (u_int)dwRecvLength);
+			continue;
+		}
+		memcpy(ik, cursor, AKA_IK_LEN);
+		cursor += AKA_IK_LEN;
 
 		found = TRUE;
 
