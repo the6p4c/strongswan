@@ -362,7 +362,315 @@ METHOD(simaka_card_t, get_quintuplet, status_t,
 	char rand[AKA_RAND_LEN], char autn[AKA_AUTN_LEN], char ck[AKA_CK_LEN],
 	char ik[AKA_IK_LEN], char res[AKA_RES_MAX], int *res_len)
 {
-	return NOT_SUPPORTED;
+	status_t found = FALSE;
+	LONG rv;
+	SCARDCONTEXT hContext;
+	DWORD dwReaders;
+	LPSTR mszReaders;
+	char *cur_reader;
+	char full_nai[128];
+	SCARDHANDLE hCard;
+	enum { DISCONNECTED, CONNECTED, TRANSACTION } hCard_status = DISCONNECTED;
+
+	snprintf(full_nai, sizeof(full_nai), "%Y", id);
+
+	DBG2(DBG_IKE, "looking for triplet: %Y rand %b", id, rand, SIM_RAND_LEN);
+
+	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &hContext);
+	if (rv != SCARD_S_SUCCESS)
+	{
+		DBG1(DBG_IKE, "SCardEstablishContext: %s", pcsc_stringify_error(rv));
+		return FALSE;
+	}
+
+	rv = SCardListReaders(hContext, NULL, NULL, &dwReaders);
+	if (rv != SCARD_S_SUCCESS)
+	{
+		DBG1(DBG_IKE, "SCardListReaders: %s", pcsc_stringify_error(rv));
+		return FALSE;
+	}
+	mszReaders = malloc(sizeof(char)*dwReaders);
+
+	rv = SCardListReaders(hContext, NULL, mszReaders, &dwReaders);
+	if (rv != SCARD_S_SUCCESS)
+	{
+		DBG1(DBG_IKE, "SCardListReaders: %s", pcsc_stringify_error(rv));
+		free(mszReaders);
+		return FALSE;
+	}
+
+	DBG0(DBG_IKE, "dwReaders = %d", dwReaders);
+
+	/* mszReaders is a multi-string of readers, separated by '\0' and
+	 * terminated by an additional '\0' */
+	for (cur_reader = mszReaders; *cur_reader != '\0' && found == FALSE;
+		 cur_reader += strlen(cur_reader) + 1)
+	{
+		DWORD dwActiveProtocol = -1;
+		const SCARD_IO_REQUEST *pioSendPci;
+		SCARD_IO_REQUEST pioRecvPci;
+		BYTE pbRecvBuffer[64];
+		DWORD dwRecvLength;
+		char imsi[SIM_IMSI_MAX_LEN + 1];
+
+		/* See GSM 11.11 for SIM APDUs */
+		static const BYTE pbSelectMF[] = { 0xa0, 0xa4, 0x00, 0x00, 0x02, 0x3f, 0x00 };
+		static const BYTE pbSelectDFGSM[] = { 0xa0, 0xa4, 0x00, 0x00, 0x02, 0x7f, 0x20 };
+		static const BYTE pbSelectIMSI[] = { 0xa0, 0xa4, 0x00, 0x00, 0x02, 0x6f, 0x07 };
+		static const BYTE pbReadBinary[] = { 0xa0, 0xb0, 0x00, 0x00, 0x09 };
+		static const BYTE pbSelectUSIM[] = {
+			0x00, 0xa4, 0x04, 0x00,
+			0x10,
+			0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0x49, 0xFF, 0xFF, 0x89, 0x04, 0x0B, 0x00, 0xFF
+		};
+		BYTE pbRunUMTSAlgorithm[5 + 1 + AKA_RAND_LEN + 1 + AKA_AUTN_LEN] = { 0x00, 0x88, 0x00, 0x81, 0x22 };
+		BYTE pbGetResponse[] = { 0x00, 0xc0, 0x00, 0x00, 0x00 };
+
+		DBG0(DBG_IKE, "cur_reader = %d \"%s\"", cur_reader, cur_reader);
+
+		/* If on 2nd or later reader, make sure we end the transaction
+		 * and disconnect card in the previous reader */
+		switch (hCard_status)
+		{
+			case TRANSACTION:
+				SCardEndTransaction(hCard, SCARD_LEAVE_CARD);
+				/* FALLTHRU */
+			case CONNECTED:
+				SCardDisconnect(hCard, SCARD_LEAVE_CARD);
+				/* FALLTHRU */
+			case DISCONNECTED:
+				hCard_status = DISCONNECTED;
+		}
+
+		/* Copy RAND and AUTN into APDU */
+		pbRunUMTSAlgorithm[5] = AKA_RAND_LEN;
+		memcpy(pbRunUMTSAlgorithm + 6, rand, AKA_RAND_LEN);
+		pbRunUMTSAlgorithm[6 + AKA_RAND_LEN] = AKA_AUTN_LEN;
+		memcpy(pbRunUMTSAlgorithm + 6 + AKA_RAND_LEN + 1, autn, AKA_AUTN_LEN);
+
+		rv = SCardConnect(hContext, cur_reader, SCARD_SHARE_SHARED,
+			SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, &hCard, &dwActiveProtocol);
+		if (rv != SCARD_S_SUCCESS)
+		{
+			DBG1(DBG_IKE, "SCardConnect: %s", pcsc_stringify_error(rv));
+			continue;
+		}
+		hCard_status = CONNECTED;
+
+		switch(dwActiveProtocol)
+		{
+			case SCARD_PROTOCOL_T0:
+				pioSendPci = SCARD_PCI_T0;
+				break;
+			case SCARD_PROTOCOL_T1:
+				pioSendPci = SCARD_PCI_T1;
+				break;
+			default:
+				DBG1(DBG_IKE, "Unknown SCARD_PROTOCOL");
+				continue;
+		}
+
+		/* Start transaction */
+		rv = SCardBeginTransaction(hCard);
+		if (rv != SCARD_S_SUCCESS)
+		{
+			DBG1(DBG_IKE, "SCardBeginTransaction: %s", pcsc_stringify_error(rv));
+			continue;
+		}
+		hCard_status = TRANSACTION;
+
+		/* APDU: Select MF */
+		dwRecvLength = sizeof(pbRecvBuffer);
+		rv = SCardTransmit(hCard, pioSendPci, pbSelectMF, sizeof(pbSelectMF),
+						   &pioRecvPci, pbRecvBuffer, &dwRecvLength);
+		if (rv != SCARD_S_SUCCESS)
+		{
+			DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+			continue;
+		}
+		if (dwRecvLength < APDU_STATUS_LEN ||
+			pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN] != APDU_SW1_RESPONSE_DATA)
+		{
+			DBG1(DBG_IKE, "Select MF failed: %b", pbRecvBuffer,
+				 (u_int)dwRecvLength);
+			continue;
+		}
+
+		/* APDU: Select DF GSM */
+		dwRecvLength = sizeof(pbRecvBuffer);
+		rv = SCardTransmit(hCard, pioSendPci, pbSelectDFGSM, sizeof(pbSelectDFGSM),
+						   &pioRecvPci, pbRecvBuffer, &dwRecvLength);
+		if (rv != SCARD_S_SUCCESS)
+		{
+			DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+			continue;
+		}
+		if (dwRecvLength < APDU_STATUS_LEN ||
+			pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN] != APDU_SW1_RESPONSE_DATA)
+		{
+			DBG1(DBG_IKE, "Select DF GSM failed: %b", pbRecvBuffer,
+				 (u_int)dwRecvLength);
+			continue;
+		}
+
+		/* APDU: Select IMSI */
+		dwRecvLength = sizeof(pbRecvBuffer);
+		rv = SCardTransmit(hCard, pioSendPci, pbSelectIMSI, sizeof(pbSelectIMSI),
+						   &pioRecvPci, pbRecvBuffer, &dwRecvLength);
+		if (rv != SCARD_S_SUCCESS)
+		{
+			DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+			continue;
+		}
+		if (dwRecvLength < APDU_STATUS_LEN ||
+			pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN] != APDU_SW1_RESPONSE_DATA)
+		{
+			DBG1(DBG_IKE, "Select IMSI failed: %b", pbRecvBuffer,
+				 (u_int)dwRecvLength);
+			continue;
+		}
+
+		/* APDU: Read Binary (of IMSI) */
+		dwRecvLength = sizeof(pbRecvBuffer);
+		rv = SCardTransmit(hCard, pioSendPci, pbReadBinary, sizeof(pbReadBinary),
+						   &pioRecvPci, pbRecvBuffer, &dwRecvLength);
+		if (rv != SCARD_S_SUCCESS)
+		{
+			DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+			continue;
+		}
+		if (dwRecvLength < APDU_STATUS_LEN ||
+			pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN] != APDU_SW1_SUCCESS)
+		{
+			DBG1(DBG_IKE, "Select IMSI failed: %b", pbRecvBuffer,
+				 (u_int)dwRecvLength);
+			continue;
+		}
+
+		if (!decode_imsi_ef(pbRecvBuffer, dwRecvLength-APDU_STATUS_LEN, imsi))
+		{
+			DBG1(DBG_IKE, "Couldn't decode IMSI EF: %b",
+				 pbRecvBuffer, (u_int)dwRecvLength);
+			continue;
+		}
+
+		/* The IMSI could be post/prefixed in the full NAI, so just make sure
+		 * it's in there */
+		if (!(strlen(full_nai) && strstr(full_nai, imsi)))
+		{
+			DBG1(DBG_IKE, "Not the SIM we're looking for, IMSI: %s", imsi);
+			continue;
+		}
+
+		DBG0(DBG_IKE, "oh hello there");
+
+		/* APDU: Select USIM */
+		dwRecvLength = sizeof(pbRecvBuffer);
+		rv = SCardTransmit(hCard, pioSendPci, pbSelectUSIM, sizeof(pbSelectUSIM),
+						   &pioRecvPci, pbRecvBuffer, &dwRecvLength);
+		DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+		if (rv != SCARD_S_SUCCESS)
+		{
+			DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+			continue;
+		}
+		DBG1(DBG_IKE, "Select USIM: %d %02x%02x", pbRecvBuffer, pbRecvBuffer[0], pbRecvBuffer[1]);
+		if (dwRecvLength < APDU_STATUS_LEN ||
+			pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN] != 0x61)
+		{
+			DBG1(DBG_IKE, "Select USIM failed: %b", pbRecvBuffer,
+				 (u_int)dwRecvLength);
+			continue;
+		}
+
+		/* APDU: Run UMTS Algorithm */
+		dwRecvLength = sizeof(pbRecvBuffer);
+		rv = SCardTransmit(hCard, pioSendPci,
+						   pbRunUMTSAlgorithm, sizeof(pbRunUMTSAlgorithm),
+						   &pioRecvPci, pbRecvBuffer, &dwRecvLength);
+		DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+		if (rv != SCARD_S_SUCCESS)
+		{
+			DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+			continue;
+		}
+		DBG1(DBG_IKE, "Run UMTS Algorithm: %d %02x%02x", (u_int)dwRecvLength, pbRecvBuffer[0], pbRecvBuffer[1]);
+		if (dwRecvLength < APDU_STATUS_LEN ||
+			pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN] != 0x61)
+		{
+			DBG1(DBG_IKE, "Run UMTS Algorithm failed: %b",
+				 pbRecvBuffer, (u_int)dwRecvLength);
+			continue;
+		}
+
+		/* APDU: Get Response (of Run UMTS Algorithm) */
+		pbGetResponse[4] = pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN+1]; // Le
+		dwRecvLength = sizeof(pbRecvBuffer);
+		rv = SCardTransmit(hCard, pioSendPci, pbGetResponse, sizeof(pbGetResponse),
+						   &pioRecvPci, pbRecvBuffer, &dwRecvLength);
+		DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+		if (rv != SCARD_S_SUCCESS)
+		{
+			DBG1(DBG_IKE, "SCardTransmit: %s", pcsc_stringify_error(rv));
+			continue;
+		}
+
+		DBG1(DBG_IKE, "Get Response: %d", (u_int)dwRecvLength);
+		if (dwRecvLength < APDU_STATUS_LEN ||
+			pbRecvBuffer[dwRecvLength-APDU_STATUS_LEN] != APDU_SW1_SUCCESS)
+		{
+			DBG1(DBG_IKE, "Get Response failed: %b", pbRecvBuffer,
+				 (u_int)dwRecvLength);
+			continue;
+		}
+
+		BYTE *buf = pbRecvBuffer;
+		if (*buf != 0xdb) {
+			DBG1(DBG_IKE, "Get Response incorrect tag: %02x", *buf);
+			continue;
+		}
+		buf++;
+
+		*res_len = *buf;
+		buf++;
+		memcpy(res, buf, *res_len);
+		buf += *res_len;
+
+		buf++;
+		memcpy(ck, buf, AKA_CK_LEN);
+		buf += AKA_CK_LEN;
+
+		buf++;
+		memcpy(ik, buf, AKA_IK_LEN);
+		buf += AKA_IK_LEN;
+
+		found = TRUE;
+
+		/* Transaction will be ended and card disconnected at the
+		 * beginning of this loop or after this loop */
+	}
+
+	/* Make sure we end any previous transaction and disconnect card */
+	switch (hCard_status)
+	{
+		case TRANSACTION:
+			SCardEndTransaction(hCard, SCARD_LEAVE_CARD);
+			/* FALLTHRU */
+		case CONNECTED:
+			SCardDisconnect(hCard, SCARD_LEAVE_CARD);
+			/* FALLTHRU */
+		case DISCONNECTED:
+			hCard_status = DISCONNECTED;
+	}
+
+	rv = SCardReleaseContext(hContext);
+	if (rv != SCARD_S_SUCCESS)
+	{
+		DBG1(DBG_IKE, "SCardReleaseContext: %s", pcsc_stringify_error(rv));
+	}
+
+	free(mszReaders);
+	return found ? SUCCESS : FAILED;
 }
 
 METHOD(eap_sim_pcsc_card_t, destroy, void,
